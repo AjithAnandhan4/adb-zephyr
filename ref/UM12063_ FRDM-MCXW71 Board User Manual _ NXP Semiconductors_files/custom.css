@@ -1,0 +1,8 @@
+
+.sl.simple .sli {
+    display: list-item !important;
+}
+
+.sl.simple .sli .xref:not(.fn_pdf_callout) {
+    display: inline !important;
+}
