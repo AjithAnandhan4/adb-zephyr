@@ -1,0 +1,11 @@
+/* FRDM-MCXN236 USB overlay for ADB bring-up.
+ *
+ * The FRDM-MCXN236 board DTS already defines zephyr_udc0 as an alias for
+ * usb1 (the HS-capable EHCI controller). No child nodes are needed since
+ * the ADB class uses USBD_DEFINE_CLASS (not DT-based instantiation).
+ *
+ * This file is intentionally minimal — the ADB class instance is registered
+ * programmatically via usbd_register_class(), not via DTS.
+ */
+
+/* Nothing to add: zephyr_udc0 is already defined in the board DTS. */
