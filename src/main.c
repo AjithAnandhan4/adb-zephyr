@@ -11,8 +11,10 @@
 #include <zephyr/logging/log.h>
 #include <string.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/drivers/hwinfo.h>
 
 #include "adb.h"
+#include "adb_shell.h"
 
 LOG_MODULE_REGISTER(adb_main, LOG_LEVEL_DBG);
 
@@ -43,12 +45,37 @@ static uint8_t rx_stream[RX_STREAM_MAX];
 static size_t rx_len = 0;
 
 /* ── TX Buffer Pool ── */
-#define TX_BUF_COUNT 3
+#define TX_BUF_COUNT 8
 USB_STATIC_BUF_DEFINE(tx_buf_0, RX_STREAM_MAX);
 USB_STATIC_BUF_DEFINE(tx_buf_1, RX_STREAM_MAX);
 USB_STATIC_BUF_DEFINE(tx_buf_2, RX_STREAM_MAX);
+USB_STATIC_BUF_DEFINE(tx_buf_3, RX_STREAM_MAX);
+USB_STATIC_BUF_DEFINE(tx_buf_4, RX_STREAM_MAX);
+USB_STATIC_BUF_DEFINE(tx_buf_5, RX_STREAM_MAX);
+USB_STATIC_BUF_DEFINE(tx_buf_6, RX_STREAM_MAX);
+USB_STATIC_BUF_DEFINE(tx_buf_7, RX_STREAM_MAX);
 
-static uint8_t *const tx_pool[TX_BUF_COUNT] = { tx_buf_0, tx_buf_1, tx_buf_2 };
+static uint8_t *const tx_pool[TX_BUF_COUNT] = { tx_buf_0, tx_buf_1, tx_buf_2, tx_buf_3, tx_buf_4, tx_buf_5, tx_buf_6, tx_buf_7 };
+
+USB_STATIC_BUF_DEFINE(tx_payload_0, ADB_MAX_PAYLOAD);
+USB_STATIC_BUF_DEFINE(tx_payload_1, ADB_MAX_PAYLOAD);
+USB_STATIC_BUF_DEFINE(tx_payload_2, ADB_MAX_PAYLOAD);
+USB_STATIC_BUF_DEFINE(tx_payload_3, ADB_MAX_PAYLOAD);
+USB_STATIC_BUF_DEFINE(tx_payload_4, ADB_MAX_PAYLOAD);
+USB_STATIC_BUF_DEFINE(tx_payload_5, ADB_MAX_PAYLOAD);
+USB_STATIC_BUF_DEFINE(tx_payload_6, ADB_MAX_PAYLOAD);
+USB_STATIC_BUF_DEFINE(tx_payload_7, ADB_MAX_PAYLOAD);
+
+static uint8_t *const tx_payload_pool[TX_BUF_COUNT] = { tx_payload_0, tx_payload_1, tx_payload_2, tx_payload_3, tx_payload_4, tx_payload_5, tx_payload_6, tx_payload_7 };
+
+/*
+ * Per-slot packet storage for adb_send_packet_sync().
+ * NEVER put struct adb_packet on the stack — it is 4120 bytes and will
+ * overflow the Zephyr main/workqueue stack silently. Each slot is protected
+ * by tx_free_q: only the caller that holds idx can access tx_pkt_pool[idx].
+ */
+static struct adb_packet tx_pkt_pool[TX_BUF_COUNT];
+
 K_MSGQ_DEFINE(tx_free_q, sizeof(uint8_t), TX_BUF_COUNT, 1);
 K_MSGQ_DEFINE(tx_pending_q, sizeof(uint8_t), TX_BUF_COUNT, 1);
 
@@ -73,6 +100,43 @@ static void adb_work_fn(struct k_work *work);
 K_WORK_DEFINE(adb_work, adb_work_fn);
 
 /* ── Implementation ── */
+
+int adb_send_packet_sync(uint32_t cmd, uint32_t arg0, uint32_t arg1, const void *payload, size_t len, k_timeout_t timeout)
+{
+	uint8_t idx;
+	if (k_msgq_get(&tx_free_q, &idx, timeout) != 0) {
+		return -ENOMEM;
+	}
+
+	/* Use pre-allocated per-slot storage — never stack-allocate struct adb_packet
+	 * (it is 4120 bytes and will silently overflow any Zephyr thread stack). */
+	struct adb_packet *pkt = &tx_pkt_pool[idx];
+	pkt->command = cmd;
+	pkt->arg0 = arg0;
+	pkt->arg1 = arg1;
+	pkt->length = len;
+	
+	if (len > 0 && payload != NULL) {
+		memcpy(pkt->payload, payload, len);
+	}
+
+	adb_packet_finalize(pkt);
+
+	size_t encoded_len;
+	if (adb_encode(pkt, tx_pool[idx], RX_STREAM_MAX, &encoded_len) != 0) {
+		k_msgq_put(&tx_free_q, &idx, K_NO_WAIT);
+		return -EINVAL;
+	}
+	if (pkt->length > 0) {
+		memcpy(tx_payload_pool[idx], tx_pool[idx] + ADB_HEADER_SIZE, pkt->length);
+	}
+
+	tx_inflight_len[idx] = encoded_len;
+	k_msgq_put(&tx_pending_q, &idx, K_NO_WAIT);
+	k_work_submit(&tx_work);
+
+	return 0;
+}
 
 static void handle_cnxn(struct adb_packet *rx)
 {
@@ -116,6 +180,26 @@ static void handle_packet(struct adb_packet *rx)
 	case ADB_CMD_CNXN:
 		handle_cnxn(rx);
 		break;
+	case ADB_CMD_OPEN: {
+		LOG_INF("Received OPEN request. Length=%u", rx->length);
+		if (rx->length > 0 && rx->length <= sizeof(rx->payload)) {
+			rx->payload[rx->length - 1] = 0;
+		}
+		adb_shell_handle_open(rx->arg0, (const char *)rx->payload);
+		break;
+	}
+	case ADB_CMD_WRTE:
+		LOG_DBG("Received WRTE: local=%u remote=%u len=%u", rx->arg1, rx->arg0, rx->length);
+		adb_shell_handle_wrte(rx->arg1, rx->arg0, rx->payload, rx->length);
+		break;
+	case ADB_CMD_OKAY:
+		LOG_DBG("Received OKAY: local=%u remote=%u", rx->arg1, rx->arg0);
+		adb_shell_handle_okay(rx->arg1, rx->arg0);
+		break;
+	case ADB_CMD_CLSE:
+		LOG_INF("Received CLSE: local=%u remote=%u", rx->arg1, rx->arg0);
+		adb_shell_handle_clse(rx->arg1, rx->arg0);
+		break;
 	default:
 		LOG_WRN("Unhandled ADB command: 0x%08X", rx->command);
 		break;
@@ -139,6 +223,7 @@ static void adb_work_fn(struct k_work *work)
 			rx_len = 0;
 			ring_buf_reset(&rx_ring);
 			current_state = ADB_WAITING_CNXN;
+	adb_shell_init();
 			return;
 		}
 
@@ -151,10 +236,11 @@ static void adb_work_fn(struct k_work *work)
 		if (rc == 0) {
 			handle_packet(&pkt_rx);
 		} else {
-			LOG_ERR("Decode error %d. Dropping stream.", rc);
+			LOG_ERR("ADB decode failure: err=%d, rx_len=%u, total_len=%u. Dropping stream.", rc, rx_len, total_len);
 			rx_len = 0;
 			ring_buf_reset(&rx_ring);
 			current_state = ADB_WAITING_CNXN;
+	adb_shell_init();
 			return;
 		}
 
@@ -178,7 +264,7 @@ static void tx_work_fn(struct k_work *work)
 		idx = tx_inflight_idx;
 		size_t payload_len = tx_inflight_len[idx] - ADB_HEADER_SIZE;
 		LOG_DBG("TX payload: idx=%u len=%zu", idx, payload_len);
-		ret = usbd_adb_write(tx_pool[idx] + ADB_HEADER_SIZE, payload_len);
+		ret = usbd_adb_write(tx_payload_pool[idx], payload_len);
 		if (ret == 0) {
 			return; /* sent() will clear flag and resubmit */
 		}
@@ -194,19 +280,8 @@ static void tx_work_fn(struct k_work *work)
 	tx_inflight_idx = idx;
 	tx_current_phase = TX_PHASE_HEADER;
 
-	LOG_DBG("TX start: idx=%u len=%zu", idx, tx_inflight_len[idx]);
-
-	LOG_INF("TX CNXN packet dump:"); 
-	LOG_INF("  command: 0x%08X", sys_get_le32(tx_pool[idx] + 0)); 
-	LOG_INF("  arg0:    0x%08X", sys_get_le32(tx_pool[idx] + 4)); 
-	LOG_INF("  arg1:    0x%08X", sys_get_le32(tx_pool[idx] + 8)); 
-	LOG_INF("  length:  %u", sys_get_le32(tx_pool[idx] + 12)); 
-	LOG_INF("  cksum:   0x%08X", sys_get_le32(tx_pool[idx] + 16)); 
-	LOG_INF("  magic:   0x%08X", sys_get_le32(tx_pool[idx] + 20)); 
-	LOG_HEXDUMP_INF(tx_pool[idx], 24, "  header hex:"); 
-	if (sys_get_le32(tx_pool[idx] + 12) > 0) { 
-		LOG_HEXDUMP_INF(tx_pool[idx] + 24, sys_get_le32(tx_pool[idx] + 12), "  payload hex:"); 
-	}
+	LOG_DBG("TX start: idx=%u cmd=0x%08X len=%u", idx,
+		sys_get_le32(tx_pool[idx] + 0), sys_get_le32(tx_pool[idx] + 12));
 
 	ret = usbd_adb_write(tx_pool[idx], ADB_HEADER_SIZE);
 	if (ret == 0) {
@@ -218,7 +293,6 @@ error:
 	k_msgq_put(&tx_free_q, &tx_inflight_idx, K_NO_WAIT);
 	tx_current_phase = TX_PHASE_IDLE;
 	atomic_clear_bit(tx_active, 0);
-	tx_current_phase = TX_PHASE_IDLE;
 	k_work_submit(&tx_work);
 }
 
@@ -228,13 +302,14 @@ static void adb_connected_cb(struct usbd_class_data *c_data)
 {
 	LOG_INF("USB connected");
 	current_state = ADB_WAITING_CNXN;
+	adb_shell_init();
 }
 
 static void adb_disconnected_cb(struct usbd_class_data *c_data)
 {
 	uint8_t idx;
 
-	LOG_INF("USB disconnected");
+	LOG_INF("USB disconnected callback triggered!");
 	current_state = ADB_DISCONNECTED;
 	
 	atomic_clear_bit(tx_active, 0);
@@ -263,7 +338,7 @@ static void adb_sent_cb(struct usbd_class_data *c_data, const uint8_t *buf, size
 {
 	const uint8_t *expected_buf = (tx_current_phase == TX_PHASE_HEADER) ? 
 				      tx_pool[tx_inflight_idx] : 
-				      tx_pool[tx_inflight_idx] + ADB_HEADER_SIZE;
+				      tx_payload_pool[tx_inflight_idx];
 
 	if (buf != expected_buf) {
 		LOG_ERR("sent() buf mismatch: expected %p, got %p", expected_buf, buf);
