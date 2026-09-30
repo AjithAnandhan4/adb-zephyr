@@ -1,0 +1,45 @@
+# ADB protocol engine options (application side; the USB transport lives
+# in the usbd_adb class driver and is configured by CONFIG_USBD_ADB_*).
+
+menu "ADB protocol engine"
+
+config ADB_SHELL_COUNT
+	int "Number of concurrent 'adb shell' sessions"
+	default 1
+	range 1 4
+	help
+	  Each session statically allocates a Zephyr shell instance (its own
+	  thread stack of CONFIG_SHELL_STACK_SIZE plus context and buffers),
+	  so every extra session costs roughly 3 KB of RAM. An OPEN for a
+	  shell beyond this limit is rejected with CLSE.
+
+config ADB_SHELL_RX_BUF_SIZE
+	int "Per-session shell input ring buffer size in bytes"
+	default 256
+
+config ADB_SYNC
+	bool "ADB sync service (adb push / adb pull / adb ls)"
+	default y
+	depends on FILE_SYSTEM
+	help
+	  Serve the "sync:" service on top of the Zephyr VFS. One sync
+	  session is handled at a time by a dedicated thread.
+
+if ADB_SYNC
+
+config ADB_SYNC_STACK_SIZE
+	int "Sync service thread stack size"
+	default 3072
+	help
+	  LittleFS metadata commits (file create, directory compaction)
+	  are the deepest call chains on this thread.
+
+config ADB_SYNC_THREAD_PRIORITY
+	int "Sync service thread priority"
+	default 7
+
+endif # ADB_SYNC
+
+endmenu
+
+source "Kconfig.zephyr"

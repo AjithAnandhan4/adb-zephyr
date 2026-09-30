@@ -12,14 +12,6 @@ LOG_MODULE_REGISTER(adb_shell, LOG_LEVEL_INF);
 /* External function to send ADB packets (defined in main.c) */
 extern int adb_send_packet_sync(uint32_t cmd, uint32_t arg0, uint32_t arg1, const void *payload, size_t len, k_timeout_t timeout);
 
-#ifndef CONFIG_USBD_ADB_SHELL_COUNT
-#define CONFIG_USBD_ADB_SHELL_COUNT 2
-#endif
-
-#ifndef CONFIG_USBD_ADB_SHELL_RX_BUF_SIZE
-#define CONFIG_USBD_ADB_SHELL_RX_BUF_SIZE 256
-#endif
-
 struct adb_shell_session {
 	bool in_use;
 	uint32_t local_id;
@@ -27,12 +19,12 @@ struct adb_shell_session {
 	struct shell *sh;
 	struct k_sem okay_sem;
 	struct ring_buf rx_ring;
-	uint8_t rx_buf[CONFIG_USBD_ADB_SHELL_RX_BUF_SIZE];
+	uint8_t rx_buf[CONFIG_ADB_SHELL_RX_BUF_SIZE];
 	shell_transport_handler_t shell_handler;
 	void *shell_context;
 };
 
-static struct adb_shell_session shell_sessions[CONFIG_USBD_ADB_SHELL_COUNT];
+static struct adb_shell_session shell_sessions[CONFIG_ADB_SHELL_COUNT];
 static K_MUTEX_DEFINE(shell_lock);
 
 static int adb_shell_transport_init(const struct shell_transport *transport,
@@ -128,17 +120,17 @@ const struct shell_transport_api adb_shell_transport_api = {
 	}; \
 	SHELL_DEFINE(adb_shell_##n, "adb:$ ", &shell_transport_adb_##n, 10, 10, SHELL_FLAG_OLF_CRLF);
 
-LISTIFY(CONFIG_USBD_ADB_SHELL_COUNT, ADB_SHELL_DEFINE_INST, (;))
+LISTIFY(CONFIG_ADB_SHELL_COUNT, ADB_SHELL_DEFINE_INST, (;))
 
 static const struct shell *const adb_shell_instances[] = {
-	LISTIFY(CONFIG_USBD_ADB_SHELL_COUNT, ADB_SHELL_NAME, (,))
+	LISTIFY(CONFIG_ADB_SHELL_COUNT, ADB_SHELL_NAME, (,))
 };
 
 void adb_shell_init(void)
 {
-	for (size_t i = 0; i < CONFIG_USBD_ADB_SHELL_COUNT; i++) {
+	for (size_t i = 0; i < CONFIG_ADB_SHELL_COUNT; i++) {
 		shell_sessions[i].in_use = false;
-		ring_buf_init(&shell_sessions[i].rx_ring, CONFIG_USBD_ADB_SHELL_RX_BUF_SIZE, shell_sessions[i].rx_buf);
+		ring_buf_init(&shell_sessions[i].rx_ring, CONFIG_ADB_SHELL_RX_BUF_SIZE, shell_sessions[i].rx_buf);
 		shell_sessions[i].sh = (struct shell *)adb_shell_instances[i];
 		k_sem_init(&shell_sessions[i].okay_sem, 1, 1);
 	}
@@ -147,7 +139,7 @@ void adb_shell_init(void)
 static void shell_uninit_completed(const struct shell *sh, int res)
 {
 	k_mutex_lock(&shell_lock, K_FOREVER);
-	for (size_t i = 0; i < CONFIG_USBD_ADB_SHELL_COUNT; i++) {
+	for (size_t i = 0; i < CONFIG_ADB_SHELL_COUNT; i++) {
 		if (shell_sessions[i].sh == sh) {
 			shell_sessions[i].in_use = false;
 			LOG_INF("Shell slot %zu uninitialized fully.", i);
@@ -169,7 +161,7 @@ void adb_shell_handle_open(uint32_t remote_id, const char *name)
 	k_mutex_lock(&shell_lock, K_FOREVER);
 	struct adb_shell_session *sess = NULL;
 	size_t slot = 0;
-	for (size_t i = 0; i < CONFIG_USBD_ADB_SHELL_COUNT; i++) {
+	for (size_t i = 0; i < CONFIG_ADB_SHELL_COUNT; i++) {
 		if (!shell_sessions[i].in_use) {
 			sess = &shell_sessions[i];
 			slot = i;
@@ -225,7 +217,7 @@ void adb_shell_handle_wrte(uint32_t local_id, uint32_t remote_id, const uint8_t 
 	struct adb_shell_session *sess = NULL;
 
 	k_mutex_lock(&shell_lock, K_FOREVER);
-	for (size_t i = 0; i < CONFIG_USBD_ADB_SHELL_COUNT; i++) {
+	for (size_t i = 0; i < CONFIG_ADB_SHELL_COUNT; i++) {
 		if (shell_sessions[i].in_use && shell_sessions[i].local_id == local_id) {
 			sess = &shell_sessions[i];
 			break;
@@ -257,7 +249,7 @@ void adb_shell_handle_clse(uint32_t local_id, uint32_t remote_id)
 	struct adb_shell_session *sess = NULL;
 
 	k_mutex_lock(&shell_lock, K_FOREVER);
-	for (size_t i = 0; i < CONFIG_USBD_ADB_SHELL_COUNT; i++) {
+	for (size_t i = 0; i < CONFIG_ADB_SHELL_COUNT; i++) {
 		if (shell_sessions[i].in_use && shell_sessions[i].local_id == local_id) {
 			sess = &shell_sessions[i];
 			break;
@@ -284,7 +276,7 @@ void adb_shell_handle_okay(uint32_t local_id, uint32_t remote_id)
 	struct adb_shell_session *sess = NULL;
 
 	k_mutex_lock(&shell_lock, K_FOREVER);
-	for (size_t i = 0; i < CONFIG_USBD_ADB_SHELL_COUNT; i++) {
+	for (size_t i = 0; i < CONFIG_ADB_SHELL_COUNT; i++) {
 		if (shell_sessions[i].in_use && shell_sessions[i].local_id == local_id) {
 			sess = &shell_sessions[i];
 			break;
@@ -300,7 +292,7 @@ void adb_shell_handle_okay(uint32_t local_id, uint32_t remote_id)
 void adb_shell_reset(void)
 {
 	k_mutex_lock(&shell_lock, K_FOREVER);
-	for (size_t i = 0; i < CONFIG_USBD_ADB_SHELL_COUNT; i++) {
+	for (size_t i = 0; i < CONFIG_ADB_SHELL_COUNT; i++) {
 		if (shell_sessions[i].in_use) {
 			LOG_INF("Resetting shell session %zu due to host reconnect/disconnect", i);
 			/* Unblock any shell thread blocked in write() waiting for OKAY. */

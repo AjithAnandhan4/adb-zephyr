@@ -7,4 +7,5 @@ target_sources(app PRIVATE
     src/packet.c
     src/adb_shell.c
 )
+target_sources_ifdef(CONFIG_ADB_SYNC app PRIVATE src/adb_sync.c)
 

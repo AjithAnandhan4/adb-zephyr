@@ -12,9 +12,13 @@
 #include <string.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/drivers/hwinfo.h>
+#include <zephyr/fs/fs.h>
+#include <zephyr/fs/littlefs.h>
+#include <zephyr/storage/flash_map.h>
 
 #include "adb.h"
 #include "adb_shell.h"
+#include "adb_sync.h"
 
 LOG_MODULE_REGISTER(adb_main, LOG_LEVEL_DBG);
 
@@ -27,6 +31,15 @@ USBD_DESC_CONFIG_DEFINE(adb_fs_cfg_desc, "FS Configuration");
 USBD_DESC_CONFIG_DEFINE(adb_hs_cfg_desc, "HS Configuration");
 USBD_CONFIGURATION_DEFINE(adb_fs_config, USB_SCD_SELF_POWERED, 250, &adb_fs_cfg_desc);
 USBD_CONFIGURATION_DEFINE(adb_hs_config, USB_SCD_SELF_POWERED, 250, &adb_hs_cfg_desc);
+
+/* ── LittleFS on internal flash (storage_partition, 64 KB) ── */
+FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(lfs_storage);
+static struct fs_mount_t adb_lfs_mount = {
+	.type       = FS_LITTLEFS,
+	.fs_data    = &lfs_storage,
+	.storage_dev = (void *)PARTITION_ID(storage_partition),
+	.mnt_point  = "/lfs",
+};
 
 /* ── ADB State ── */
 enum adb_state {
@@ -45,28 +58,16 @@ static uint8_t rx_stream[RX_STREAM_MAX];
 static size_t rx_len = 0;
 
 /* ── TX Buffer Pool ── */
-#define TX_BUF_COUNT 8
+#define TX_BUF_COUNT 2
 USB_STATIC_BUF_DEFINE(tx_buf_0, RX_STREAM_MAX);
 USB_STATIC_BUF_DEFINE(tx_buf_1, RX_STREAM_MAX);
-USB_STATIC_BUF_DEFINE(tx_buf_2, RX_STREAM_MAX);
-USB_STATIC_BUF_DEFINE(tx_buf_3, RX_STREAM_MAX);
-USB_STATIC_BUF_DEFINE(tx_buf_4, RX_STREAM_MAX);
-USB_STATIC_BUF_DEFINE(tx_buf_5, RX_STREAM_MAX);
-USB_STATIC_BUF_DEFINE(tx_buf_6, RX_STREAM_MAX);
-USB_STATIC_BUF_DEFINE(tx_buf_7, RX_STREAM_MAX);
 
-static uint8_t *const tx_pool[TX_BUF_COUNT] = { tx_buf_0, tx_buf_1, tx_buf_2, tx_buf_3, tx_buf_4, tx_buf_5, tx_buf_6, tx_buf_7 };
+static uint8_t *const tx_pool[TX_BUF_COUNT] = { tx_buf_0, tx_buf_1 };
 
 USB_STATIC_BUF_DEFINE(tx_payload_0, ADB_MAX_PAYLOAD);
 USB_STATIC_BUF_DEFINE(tx_payload_1, ADB_MAX_PAYLOAD);
-USB_STATIC_BUF_DEFINE(tx_payload_2, ADB_MAX_PAYLOAD);
-USB_STATIC_BUF_DEFINE(tx_payload_3, ADB_MAX_PAYLOAD);
-USB_STATIC_BUF_DEFINE(tx_payload_4, ADB_MAX_PAYLOAD);
-USB_STATIC_BUF_DEFINE(tx_payload_5, ADB_MAX_PAYLOAD);
-USB_STATIC_BUF_DEFINE(tx_payload_6, ADB_MAX_PAYLOAD);
-USB_STATIC_BUF_DEFINE(tx_payload_7, ADB_MAX_PAYLOAD);
 
-static uint8_t *const tx_payload_pool[TX_BUF_COUNT] = { tx_payload_0, tx_payload_1, tx_payload_2, tx_payload_3, tx_payload_4, tx_payload_5, tx_payload_6, tx_payload_7 };
+static uint8_t *const tx_payload_pool[TX_BUF_COUNT] = { tx_payload_0, tx_payload_1 };
 
 /*
  * Per-slot packet storage for adb_send_packet_sync().
@@ -185,20 +186,37 @@ static void handle_packet(struct adb_packet *rx)
 		if (rx->length > 0 && rx->length <= sizeof(rx->payload)) {
 			rx->payload[rx->length - 1] = 0;
 		}
-		adb_shell_handle_open(rx->arg0, (const char *)rx->payload);
+		if (strncmp((const char *)rx->payload, "sync:", 5) == 0) {
+			adb_sync_handle_open(rx->arg0);
+		} else {
+			adb_shell_handle_open(rx->arg0, (const char *)rx->payload);
+		}
 		break;
 	}
+	/* Stream packets carry our local id in arg1; route them to its owner. */
 	case ADB_CMD_WRTE:
 		LOG_DBG("Received WRTE: local=%u remote=%u len=%u", rx->arg1, rx->arg0, rx->length);
-		adb_shell_handle_wrte(rx->arg1, rx->arg0, rx->payload, rx->length);
+		if (adb_sync_owns_stream(rx->arg1)) {
+			adb_sync_handle_wrte(rx->arg1, rx->arg0, rx->payload, rx->length);
+		} else {
+			adb_shell_handle_wrte(rx->arg1, rx->arg0, rx->payload, rx->length);
+		}
 		break;
 	case ADB_CMD_OKAY:
 		LOG_DBG("Received OKAY: local=%u remote=%u", rx->arg1, rx->arg0);
-		adb_shell_handle_okay(rx->arg1, rx->arg0);
+		if (adb_sync_owns_stream(rx->arg1)) {
+			adb_sync_handle_okay(rx->arg1, rx->arg0);
+		} else {
+			adb_shell_handle_okay(rx->arg1, rx->arg0);
+		}
 		break;
 	case ADB_CMD_CLSE:
 		LOG_INF("Received CLSE: local=%u remote=%u", rx->arg1, rx->arg0);
-		adb_shell_handle_clse(rx->arg1, rx->arg0);
+		if (adb_sync_owns_stream(rx->arg1)) {
+			adb_sync_handle_clse(rx->arg1, rx->arg0);
+		} else {
+			adb_shell_handle_clse(rx->arg1, rx->arg0);
+		}
 		break;
 	default:
 		LOG_WRN("Unhandled ADB command: 0x%08X", rx->command);
@@ -223,7 +241,8 @@ static void adb_work_fn(struct k_work *work)
 			rx_len = 0;
 			ring_buf_reset(&rx_ring);
 			current_state = ADB_WAITING_CNXN;
-	adb_shell_init();
+			adb_sync_reset();
+			adb_shell_init();
 			return;
 		}
 
@@ -240,7 +259,8 @@ static void adb_work_fn(struct k_work *work)
 			rx_len = 0;
 			ring_buf_reset(&rx_ring);
 			current_state = ADB_WAITING_CNXN;
-	adb_shell_init();
+			adb_sync_reset();
+			adb_shell_init();
 			return;
 		}
 
@@ -311,7 +331,8 @@ static void adb_disconnected_cb(struct usbd_class_data *c_data)
 
 	LOG_INF("USB disconnected callback triggered!");
 	current_state = ADB_DISCONNECTED;
-	
+	adb_sync_reset();
+
 	atomic_clear_bit(tx_active, 0);
 	tx_current_phase = TX_PHASE_IDLE;
 
@@ -336,8 +357,8 @@ static void adb_received_cb(struct usbd_class_data *c_data, const uint8_t *data,
 
 static void adb_sent_cb(struct usbd_class_data *c_data, const uint8_t *buf, size_t len, int err)
 {
-	const uint8_t *expected_buf = (tx_current_phase == TX_PHASE_HEADER) ? 
-				      tx_pool[tx_inflight_idx] : 
+	const uint8_t *expected_buf = (tx_current_phase == TX_PHASE_HEADER) ?
+				      tx_pool[tx_inflight_idx] :
 				      tx_payload_pool[tx_inflight_idx];
 
 	if (buf != expected_buf) {
@@ -418,9 +439,12 @@ static int usb_init(void)
 	usbd_init(ctx);
 	usbd_msg_register_cb(ctx, usbd_msg_cb);
 
-	if (!usbd_can_detect_vbus(ctx)) {
-		usbd_enable(ctx);
-	}
+	/* Always enable USB. With VBUS detection, the normal path waits for a
+	 * rising-edge interrupt on the VBUS pin. But after a soft reboot
+	 * (e.g. west flash), the cable is already plugged in so no edge fires
+	 * and the device never shows up on the host. Calling usbd_enable()
+	 * unconditionally avoids this miss. */
+	usbd_enable(ctx);
 
 	return 0;
 }
@@ -432,7 +456,15 @@ int main(void)
 	}
 
 	printk("=== ADB-Zephyr Minimal CNXN ===\n");
-	
+
+	/* Mount LittleFS — auto-formats on first boot if flash is blank */
+	int rc = fs_mount(&adb_lfs_mount);
+	if (rc < 0) {
+		printk("LittleFS mount failed (%d) — filesystem unavailable\n", rc);
+	} else {
+		printk("LittleFS mounted at /lfs (64 KB)\n");
+	}
+
 	if (usb_init()) {
 		printk("USB init failed\n");
 		return -1;
