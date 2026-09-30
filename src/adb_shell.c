@@ -22,6 +22,10 @@ struct adb_shell_session {
 	uint8_t rx_buf[CONFIG_ADB_SHELL_RX_BUF_SIZE];
 	shell_transport_handler_t shell_handler;
 	void *shell_context;
+	/* `exit` runs on this session's own shell thread; shell_uninit() can't
+	 * tear down the thread it's running on, so the command just submits
+	 * this and returns, and the system workqueue does the actual close. */
+	struct k_work close_work;
 };
 
 static struct adb_shell_session shell_sessions[CONFIG_ADB_SHELL_COUNT];
@@ -126,6 +130,8 @@ static const struct shell *const adb_shell_instances[] = {
 	LISTIFY(CONFIG_ADB_SHELL_COUNT, ADB_SHELL_NAME, (,))
 };
 
+static void adb_shell_close_work_fn(struct k_work *work);
+
 void adb_shell_init(void)
 {
 	for (size_t i = 0; i < CONFIG_ADB_SHELL_COUNT; i++) {
@@ -133,6 +139,7 @@ void adb_shell_init(void)
 		ring_buf_init(&shell_sessions[i].rx_ring, CONFIG_ADB_SHELL_RX_BUF_SIZE, shell_sessions[i].rx_buf);
 		shell_sessions[i].sh = (struct shell *)adb_shell_instances[i];
 		k_sem_init(&shell_sessions[i].okay_sem, 1, 1);
+		k_work_init(&shell_sessions[i].close_work, adb_shell_close_work_fn);
 	}
 }
 
@@ -187,7 +194,12 @@ void adb_shell_handle_open(uint32_t remote_id, const char *name)
 
 	static const struct shell_backend_config_flags cfg_flags = SHELL_DEFAULT_BACKEND_CONFIG_FLAGS;
 	int ret = shell_init(sess->sh, NULL, cfg_flags, false, LOG_LEVEL_NONE);
-	if (ret != 0 && ret != -EINVAL) {
+	/* -EINVAL: the shell was left initialized but stopped (see close paths
+	 * above — we shell_stop() rather than shell_uninit() on close, so the
+	 * thread and transport survive). -EALREADY: shell_init() sees ctx->tid
+	 * already set for the same reason. Either way the instance is reusable;
+	 * only a genuinely different error means shell_init() actually failed. */
+	if (ret != 0 && ret != -EINVAL && ret != -EALREADY) {
 		LOG_ERR("Failed to init shell (err %d)", ret);
 		k_mutex_lock(&shell_lock, K_FOREVER);
 		sess->in_use = false;
@@ -195,20 +207,25 @@ void adb_shell_handle_open(uint32_t remote_id, const char *name)
 		adb_send_packet_sync(ADB_CMD_CLSE, sess->local_id, remote_id, NULL, 0, K_NO_WAIT);
 		return;
 	}
-	if (ret == -EINVAL) {
-		LOG_INF("Shell already initialized. Starting it...");
+	if (ret == -EINVAL || ret == -EALREADY) {
+		LOG_INF("Shell already initialized (err %d). Starting it...", ret);
 		shell_start(sess->sh);
 	}
 
 	LOG_INF("Mapped host %u to shell slot %zu (local_id %u), shell_init returned %d", remote_id, slot, sess->local_id, ret);
 	adb_send_packet_sync(ADB_CMD_OKAY, sess->local_id, remote_id, NULL, 0, K_NO_WAIT);
 
+	/* Feed a bare "\r" even when there's no extra command text: nothing
+	 * draws the prompt on its own until the shell processes *something*
+	 * (shell_start() itself doesn't print one — see the reopen path
+	 * above), so without this the client shows nothing until the user's
+	 * own first keypress happens to trigger it. */
 	if (strlen(name) > 6) {
 		ring_buf_put(&sess->rx_ring, (const uint8_t *)(name + 6), strlen(name + 6));
-		ring_buf_put(&sess->rx_ring, (const uint8_t *)"\r", 1);
-		if (sess->shell_handler) {
-			sess->shell_handler(SHELL_TRANSPORT_EVT_RX_RDY, sess->shell_context);
-		}
+	}
+	ring_buf_put(&sess->rx_ring, (const uint8_t *)"\r", 1);
+	if (sess->shell_handler) {
+		sess->shell_handler(SHELL_TRANSPORT_EVT_RX_RDY, sess->shell_context);
 	}
 }
 
@@ -244,6 +261,75 @@ void adb_shell_handle_wrte(uint32_t local_id, uint32_t remote_id, const uint8_t 
 	}
 }
 
+/*
+ * Device-initiated close, run on the system workqueue (never on the
+ * session's own shell thread — see close_work's comment).
+ *
+ * Deliberately does NOT call shell_uninit(): its teardown is asynchronous
+ * (shell_uninit() just posts SHELL_SIGNAL_KILL and returns; the shell's own
+ * thread finishes the job and fires shell_uninit_completed() later), and
+ * that races with this same stream being torn down — the shell thread can
+ * end up wedged waiting on a transport OKAY that will never come because
+ * the ADB stream is already gone. Since the shell instance and its thread
+ * are static for the process lifetime anyway, and adb_shell_handle_open()
+ * already handles reopening an instance that's still initialized (shell_init()
+ * returns -EINVAL, so it just calls shell_start() again), the simplest safe
+ * close is: free the slot and shell_stop() the instance (synchronous, and
+ * safe to call from here — see its own comment about locking against a
+ * command still finishing on the shell thread). That leaves it in
+ * SHELL_STATE_INITIALIZED, so the next OPEN's shell_start() actually does
+ * something instead of silently no-op'ing on an already-ACTIVE instance.
+ */
+static void adb_shell_close_work_fn(struct k_work *work)
+{
+	struct adb_shell_session *sess = CONTAINER_OF(work, struct adb_shell_session, close_work);
+
+	k_mutex_lock(&shell_lock, K_FOREVER);
+	bool active = sess->in_use;
+	if (active) {
+		sess->in_use = false;
+		ring_buf_reset(&sess->rx_ring);
+	}
+	k_mutex_unlock(&shell_lock);
+
+	if (!active) {
+		return;
+	}
+
+	shell_stop(sess->sh);
+
+	LOG_INF("Shell session exiting by command (local %u, remote %u)", sess->local_id,
+		sess->remote_id);
+	adb_send_packet_sync(ADB_CMD_CLSE, sess->local_id, sess->remote_id, NULL, 0, K_NO_WAIT);
+}
+
+static int cmd_exit(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	k_mutex_lock(&shell_lock, K_FOREVER);
+	struct adb_shell_session *sess = NULL;
+	for (size_t i = 0; i < CONFIG_ADB_SHELL_COUNT; i++) {
+		if (shell_sessions[i].in_use && shell_sessions[i].sh == sh) {
+			sess = &shell_sessions[i];
+			break;
+		}
+	}
+	k_mutex_unlock(&shell_lock);
+
+	if (sess == NULL) {
+		return -ENODEV;
+	}
+
+	/* Submit and return: freeing the slot from here (the shell's own
+	 * thread) would race the shell's own post-command bookkeeping, so
+	 * hand it to the system workqueue right after this command returns. */
+	k_work_submit(&sess->close_work);
+	return 0;
+}
+SHELL_CMD_REGISTER(exit, NULL, "Close this adb shell session", cmd_exit);
+
 void adb_shell_handle_clse(uint32_t local_id, uint32_t remote_id)
 {
 	struct adb_shell_session *sess = NULL;
@@ -252,6 +338,8 @@ void adb_shell_handle_clse(uint32_t local_id, uint32_t remote_id)
 	for (size_t i = 0; i < CONFIG_ADB_SHELL_COUNT; i++) {
 		if (shell_sessions[i].in_use && shell_sessions[i].local_id == local_id) {
 			sess = &shell_sessions[i];
+			shell_sessions[i].in_use = false;
+			ring_buf_reset(&shell_sessions[i].rx_ring);
 			break;
 		}
 	}
@@ -262,13 +350,13 @@ void adb_shell_handle_clse(uint32_t local_id, uint32_t remote_id)
 	}
 
 	LOG_INF("Closing shell session (local %u, remote %u)", local_id, remote_id);
-	
-	/* Acknowledge CLSE if it came from host. If it's internal, the other side handles it. 
-	 * ADB protocol typically says just send CLSE back. */
-	adb_send_packet_sync(ADB_CMD_CLSE, sess->local_id, remote_id, NULL, 0, K_NO_WAIT);
 
-	/* uninit asynchronously; completion callback clears in_use */
-	shell_uninit(sess->sh, shell_uninit_completed);
+	/* Do NOT shell_uninit() here: see the comment on adb_shell_close_work_fn()
+	 * — its teardown is async and racy against a stream that's already gone,
+	 * and can wedge the shell thread. shell_stop() is synchronous and leaves
+	 * the instance ready for shell_start() on the next OPEN. */
+	shell_stop(sess->sh);
+	adb_send_packet_sync(ADB_CMD_CLSE, sess->local_id, remote_id, NULL, 0, K_NO_WAIT);
 }
 
 void adb_shell_handle_okay(uint32_t local_id, uint32_t remote_id)
@@ -305,7 +393,7 @@ void adb_shell_reset(void)
 			 */
 			shell_sessions[i].in_use = false;
 			ring_buf_reset(&shell_sessions[i].rx_ring);
-			shell_uninit(shell_sessions[i].sh, NULL);
+			shell_uninit(shell_sessions[i].sh, shell_uninit_completed);
 		}
 	}
 	k_mutex_unlock(&shell_lock);
